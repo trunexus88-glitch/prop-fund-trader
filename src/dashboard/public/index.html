@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TRU-NEXUS | Autonomous Trading System</title>
+  <meta name="description" content="Real-time monitoring dashboard for the TRU-NEXUS prop firm trading system">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Header -->
+  <header class="header">
+    <div class="header-left">
+      <div class="logo">
+        <div class="logo-icon">⚡</div>
+        <div class="logo-text">TRU-NEXUS</div>
+      </div>
+      <div class="status-badge" id="systemStatus">
+        <span class="pulse"></span>
+        <span class="status-text">CONNECTING</span>
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="header-stat">
+        <span class="stat-label">Uptime</span>
+        <span class="stat-value" id="uptime">00:00:00</span>
+      </div>
+      <div class="header-stat">
+        <span class="stat-label">Signals Today</span>
+        <span class="stat-value" id="signalsToday">0</span>
+      </div>
+      <div class="header-stat">
+        <span class="stat-label">Trades Today</span>
+        <span class="stat-value" id="tradesToday">0</span>
+      </div>
+      <div class="mode-badge" id="modeBadge">PAPER</div>
+    </div>
+  </header>
+
+  <!-- Main Content -->
+  <main class="main">
+    <!-- Account Cards Grid -->
+    <section class="section">
+      <h2 class="section-title">
+        <span class="section-icon">📊</span>
+        Account Overview
+      </h2>
+      <div class="accounts-grid" id="accountsGrid">
+        <!-- Populated dynamically -->
+        <div class="loading-card">
+          <div class="spinner"></div>
+          <p>Connecting to engine...</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Two-Column Layout -->
+    <div class="two-col">
+      <!-- Drawdown Gauges -->
+      <section class="section">
+        <h2 class="section-title">
+          <span class="section-icon">🎯</span>
+          Risk Monitors
+        </h2>
+        <div class="risk-monitors" id="riskMonitors">
+          <!-- Populated dynamically -->
+        </div>
+      </section>
+
+      <!-- Event Log -->
+      <section class="section">
+        <h2 class="section-title">
+          <span class="section-icon">📋</span>
+          Engine Events
+        </h2>
+        <div class="event-log" id="eventLog">
+          <div class="event-item info">
+            <span class="event-time">--:--:--</span>
+            <span class="event-text">Waiting for events...</span>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Prop Fund Readiness -->
+    <section class="section" id="propFundSection">
+      <h2 class="section-title">
+        <span class="section-icon">🎯</span>
+        Prop Fund Readiness
+        <span class="section-subtitle">$5K account · 2-week paper qualifying period</span>
+      </h2>
+      <div id="propFundReadiness">
+        <div class="loading-card">
+          <div class="spinner"></div>
+          <p>Loading readiness data...</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Trade History -->
+    <section class="section">
+      <h2 class="section-title">
+        <span class="section-icon">📈</span>
+        Recent Trades
+      </h2>
+      <div class="table-container">
+        <table class="trades-table" id="tradesTable">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Account</th>
+              <th>Instrument</th>
+              <th>Side</th>
+              <th>Lots</th>
+              <th>Entry</th>
+              <th>Exit</th>
+              <th>P&L</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody id="tradesBody">
+            <tr class="empty-row">
+              <td colspan="9">No trades yet</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <span>TRU-NEXUS v1.0 • Autonomous Trading System</span>
+    <span id="lastUpdate">Last update: --</span>
+  </footer>
+
+  <script src="app.js"></script>
+  <script src="prop-fund.js"></script>
+</body>
+</html>
