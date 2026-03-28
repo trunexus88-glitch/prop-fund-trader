@@ -81,7 +81,12 @@ export class PositionSizer {
 
     // 2. Scale risk by signal confidence (50-100 maps to 0.5-1.0 multiplier)
     const confidenceMultiplier = Math.max(0.5, Math.min(1.0, request.signal_confidence / 100));
-    const adjustedRiskPct = riskCap * confidenceMultiplier;
+
+    // Phase 21 — Execution tier multiplier (FULL=1.0, HALF=0.5, QUARTER=0.25)
+    // Applied on top of the confidence multiplier so tiers genuinely halve/quarter
+    // the base risk cap rather than just nudging the confidence band.
+    const tierMult = request.tier_multiplier ?? 1.0;
+    const adjustedRiskPct = riskCap * tierMult * confidenceMultiplier;
 
     // 3. Calculate max risk amount in dollars
     const maxRiskFromCap = this.initialBalance * adjustedRiskPct;

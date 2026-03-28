@@ -13,6 +13,12 @@ import type { Candle, TradeSignal, MarketRegime, IndicatorSnapshot, OrderSide } 
 import { generateIndicatorSnapshot, atr } from './indicators.js';
 import { signalLogger } from '../utils/logger.js';
 import { eventBus } from '../utils/event-bus.js';
+import { computeVolatilitySurface } from '../engine/volatility-engine.js';
+import { computeStateScore } from '../engine/state-engine.js';
+import { computeMetaConfidence, TIER_MULTIPLIERS } from '../engine/meta-confidence.js';
+import type { RegimeAlignment } from '../engine/meta-confidence.js';
+import { isDirectionBlocked } from './asset-clusters.js';
+import type { MacroRegimeState } from './macro-regime-classifier.js';
 
 export interface SignalGeneratorConfig {
   minConfidence: number;          // Default: 70
@@ -266,6 +272,150 @@ export class SignalGenerator {
       default:
         return score;
     }
+  }
+
+  // ─── Phase 21 — VQ++ State Engine ─────────────────────────────────────────
+
+  /**
+   * Generate a single trade signal using the continuous state engine, adaptive
+   * volatility surface, and meta-confidence tier system.
+   *
+   * This is the ANALYST'S primary scoring path going forward.  The legacy
+   * generateSignals() is retained for backward compatibility.
+   *
+   * The method internalises what was previously scattered across index.ts:
+   *   - Macro regime direction gate (isDirectionBlocked)
+   *   - Regime alignment bonus/penalty
+   *   - Adaptive stop / take-profit via VolatilitySurface
+   *   - Execution tier (FULL / HALF / QUARTER / NO_TRADE)
+   *
+   * @returns Array of 0 or 1 signals (one per instrument per call)
+   */
+  generateSignalsV2(
+    instrument: string,
+    candles: Candle[],
+    extraCandles?: { candles4h?: Candle[]; candles1d?: Candle[] },
+    macroRegime?: MacroRegimeState
+  ): TradeSignal[] {
+    if (candles.length < 200) {
+      signalLogger.warn('[v2] Insufficient candle data', { instrument, count: candles.length });
+      return [];
+    }
+
+    const indicators = generateIndicatorSnapshot(candles);
+    const close = candles[candles.length - 1].close;
+
+    // Guard: ATR must be valid
+    if (isNaN(indicators.atr_14) || indicators.atr_14 <= 0) {
+      signalLogger.warn('[v2] ATR invalid — skipping', { instrument });
+      return [];
+    }
+
+    // 1. Volatility surface — adaptive stop/TP multipliers
+    const volSurface = computeVolatilitySurface(
+      candles,
+      extraCandles?.candles4h,
+      extraCandles?.candles1d
+    );
+
+    // 2. Continuous state score (-1.0 to +1.0)
+    const stateResult = computeStateScore(indicators, close);
+
+    // 3. Direction gate — no trade on NEUTRAL state
+    if (!stateResult.direction) {
+      signalLogger.debug('[v2] Neutral state — no trade', {
+        instrument,
+        score: stateResult.score.toFixed(3),
+      });
+      return [];
+    }
+
+    const side: OrderSide = stateResult.direction === 'LONG' ? 'buy' : 'sell';
+
+    // 4. Macro regime alignment (ALIGNED / NEUTRAL / CONFLICTING)
+    const effectiveMacroRegime = macroRegime ?? 'NEUTRAL';
+    const blocked = isDirectionBlocked(instrument, side, effectiveMacroRegime);
+
+    const regimeAlignment: RegimeAlignment = blocked
+      ? 'CONFLICTING'
+      : effectiveMacroRegime === 'NEUTRAL'
+        ? 'NEUTRAL'
+        : 'ALIGNED';
+
+    // 5. Meta-confidence — combines state score + vol surface + regime
+    const meta = computeMetaConfidence(stateResult, volSurface, regimeAlignment);
+
+    // 6. Suppression gates
+    if (meta.tier === 'NO_TRADE') {
+      signalLogger.debug('[v2] Meta-confidence below QUARTER threshold — suppressed', {
+        instrument,
+        metaConf: meta.confidence.toFixed(3),
+      });
+      return [];
+    }
+
+    if (regimeAlignment === 'CONFLICTING') {
+      signalLogger.debug('[v2] Regime gate — direction blocked by macro', {
+        instrument,
+        side,
+        regime: effectiveMacroRegime,
+      });
+      return [];
+    }
+
+    // 7. Build adaptive SL/TP from volatility surface
+    const atr1h = volSurface.atr1h;
+    const stopDist = volSurface.stopMult * atr1h;
+    const tpDist   = volSurface.tpMult   * atr1h;
+
+    const stopLoss   = side === 'buy' ? close - stopDist : close + stopDist;
+    const takeProfit = side === 'buy' ? close + tpDist   : close - tpDist;
+    const rrRatio    = stopDist > 0 ? parseFloat((tpDist / stopDist).toFixed(2)) : 0;
+
+    // 8. Build the enriched signal
+    const signal: TradeSignal = {
+      id:                generateId(),
+      timestamp:         new Date().toISOString(),
+      instrument,
+      side,
+      confidence:        Math.round(meta.confidence * 100),
+      regime:            this.currentRegime,
+      entry_price:       parseFloat(close.toFixed(5)),
+      stop_loss:         parseFloat(stopLoss.toFixed(5)),
+      take_profit:       parseFloat(takeProfit.toFixed(5)),
+      risk_reward_ratio: rrRatio,
+      confluence_factors: [
+        `State: ${stateResult.label} (${stateResult.score.toFixed(3)})`,
+        `Vol: ${volSurface.state} (stop×${volSurface.stopMult}, tp×${volSurface.tpMult})`,
+        `Regime: ${effectiveMacroRegime} [${regimeAlignment}]`,
+        `Tier: ${meta.tier} (${(meta.confidence * 100).toFixed(1)}%)`,
+      ],
+      indicator_values: indicators,
+      acted_upon:       false,
+      // Phase 21 enrichment fields
+      state_score:       parseFloat(stateResult.score.toFixed(4)),
+      state_label:       stateResult.label,
+      volatility_state:  volSurface.state,
+      regime_alignment:  regimeAlignment,
+      transition_risk:   stateResult.transitionRisk,
+      execution_tier:    meta.tier,
+      meta_confidence:   parseFloat(meta.confidence.toFixed(4)),
+    };
+
+    signalLogger.info('[v2] Signal generated', {
+      instrument,
+      side,
+      stateScore:  signal.state_score,
+      stateLabel:  signal.state_label,
+      volState:    signal.volatility_state,
+      regimeAlign: signal.regime_alignment,
+      metaConf:    signal.meta_confidence,
+      tier:        signal.execution_tier,
+      rrRatio,
+    });
+
+    eventBus.emitEngine({ type: 'SIGNAL_GENERATED', signal });
+    return [signal];
   }
 }
 

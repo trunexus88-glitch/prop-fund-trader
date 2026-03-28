@@ -110,6 +110,8 @@ export interface OrderRequest {
 
 export type MarketRegime = 'trending_up' | 'trending_down' | 'ranging' | 'volatile' | 'low_liquidity';
 
+export type ExecutionTier = 'FULL' | 'HALF' | 'QUARTER' | 'NO_TRADE';
+
 export interface TradeSignal {
   id: string;
   timestamp: string;
@@ -125,6 +127,21 @@ export interface TradeSignal {
   indicator_values: IndicatorSnapshot;
   acted_upon: boolean;
   rejection_reason?: string;
+  // ── Phase 21 — Analyst Intelligence (VQ++ state engine) ──────────────────
+  /** Continuous state score from -1.0 (max bear) to +1.0 (max bull) */
+  state_score?: number;
+  /** Human-readable state label from state engine */
+  state_label?: string;
+  /** Volatility regime at signal creation time */
+  volatility_state?: string;
+  /** How the signal direction aligns with the macro regime */
+  regime_alignment?: string;
+  /** Probability (0–1) the state reverses before trade completes */
+  transition_risk?: number;
+  /** Sizing tier from meta-confidence engine */
+  execution_tier?: ExecutionTier;
+  /** Meta-confidence value (0–1) from combined state + vol + regime */
+  meta_confidence?: number;
 }
 
 export interface IndicatorSnapshot {
@@ -193,6 +210,8 @@ export interface PositionSizeRequest {
   // Phase 20 — total exposure cap (Step 7)
   account_equity: number;                     // Current equity for 50% cap check
   current_open_risk_usd: number;              // Sum of dollar risk on all open positions
+  // Phase 21 — execution tier multiplier (FULL=1.0, HALF=0.5, QUARTER=0.25)
+  tier_multiplier?: number;
 }
 
 export interface PositionSizeResult {

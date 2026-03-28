@@ -31,7 +31,19 @@ const __dirname = dirname(__filename);
 export function startDashboard(
   accountManager: AccountManager,
   port: number = 3456,
-  propFundTracker?: PropFundTracker
+  propFundTracker?: PropFundTracker,
+  lastSignalMeta?: Map<string, {
+    instrument: string;
+    side: string;
+    stateScore: number;
+    stateLabel: string;
+    volatilityState: string;
+    regimeAlignment: string;
+    metaConfidence: number;
+    executionTier: string;
+    macroRegime: string;
+    timestamp: string;
+  }>
 ) {
   const app = express();
   const server = createServer(app);
@@ -66,6 +78,19 @@ export function startDashboard(
       drawdown: account.drawdownMonitor.update(account.state.current_equity),
       session: account.sessionManager.getState(),
       killSwitch: account.killSwitch.getState()
+    });
+  });
+
+  // Phase 21 — Last signal metadata per instrument (state score, vol, tier, etc.)
+  app.get('/api/last-signals', (_req, res) => {
+    if (!lastSignalMeta || lastSignalMeta.size === 0) {
+      res.json({ signals: [], note: 'No V2 signals generated yet' });
+      return;
+    }
+    res.json({
+      signals: Array.from(lastSignalMeta.values()).sort((a, b) =>
+        b.metaConfidence - a.metaConfidence
+      ),
     });
   });
 

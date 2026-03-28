@@ -7,10 +7,11 @@
  * accounts to prevent cross-account hedging detection.
  */
 
-import type { 
-  FirmProfile, AccountState, Position, TradeSignal, 
-  TradingAdapter, OrderRequest 
+import type {
+  FirmProfile, AccountState, Position, TradeSignal,
+  TradingAdapter, OrderRequest
 } from '../engine/types.js';
+import { TIER_MULTIPLIERS } from '../engine/meta-confidence.js';
 import { DrawdownMonitor } from '../engine/drawdown-monitor.js';
 import { DailyLossMonitor } from '../engine/daily-loss-monitor.js';
 import { PositionSizer } from '../engine/position-sizer.js';
@@ -207,6 +208,11 @@ export class AccountManager {
       return sum + stopPips * 10 * pos.lots;    // $10 per pip per standard lot
     }, 0);
 
+    // Phase 21 — resolve execution tier multiplier from enriched signal
+    const tierMult = signal.execution_tier && signal.execution_tier !== 'NO_TRADE'
+      ? TIER_MULTIPLIERS[signal.execution_tier]
+      : 1.0;
+
     const sizeResult = account.positionSizer.calculate({
       instrument: signal.instrument,
       signal_confidence: signal.confidence,
@@ -219,6 +225,7 @@ export class AccountManager {
       is_funded: false,          // Will be determined by account type
       account_equity: equity,    // Phase 20 — for 50% total exposure cap
       current_open_risk_usd: openRiskUsd,
+      tier_multiplier: tierMult, // Phase 21 — FULL/HALF/QUARTER risk scaling
     });
 
     if (!sizeResult.approved) {
@@ -264,11 +271,19 @@ export class AccountManager {
     eventBus.emitEngine({ type: 'POSITION_OPENED', position });
 
     logger.info(`Trade executed on ${account.profile.firm_id}`, {
-      signalId: signal.id,
+      signalId:          signal.id,
       lots,
-      instrument: signal.instrument,
-      side: signal.side,
-      entryPrice: position.entry_price
+      instrument:        signal.instrument,
+      side:              signal.side,
+      entryPrice:        position.entry_price,
+      // Phase 21 attribution fields
+      stateScore:        signal.state_score,
+      stateLabel:        signal.state_label,
+      volatilityState:   signal.volatility_state,
+      regimeAlignment:   signal.regime_alignment,
+      metaConfidence:    signal.meta_confidence,
+      executionTier:     signal.execution_tier,
+      transitionRisk:    signal.transition_risk,
     });
   }
 

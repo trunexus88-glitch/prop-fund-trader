@@ -39,7 +39,7 @@ import {
 import { getMacroSnapshot } from './core/lib/macro-provider.js';
 import { classifyMacroRegime, logMacroRegime, macroRegimeColor } from './strategy/macro-regime-classifier.js';
 import type { MacroRegimeState } from './strategy/macro-regime-classifier.js';
-import { isDirectionBlocked, getRegimeConfidenceAdjustment } from './strategy/asset-clusters.js';
+// isDirectionBlocked is now internal to SignalGenerator.generateSignalsV2 (Phase 21)
 import { applyCorrelationLimit } from './strategy/correlation-limiter.js';
 import type { FirmProfile, TradeSignal, EngineEvent } from './engine/types.js';
 
@@ -74,14 +74,6 @@ const SESSION_END_UTC = 17;
 const IN_SESSION_COOLDOWN_MS = 15 * 60 * 1000;   // 15 minutes
 const OUT_SESSION_COOLDOWN_MS = 60 * 60 * 1000;   // 60 minutes
 
-/**
- * Stop-loss and take-profit ATR multipliers for prop fund mode.
- * 0.5×ATR stop (tight), 3×ATR target (wide) → 6:1 R:R.
- * Need only ~14% win rate to be profitable.
- */
-const PROP_FUND_SL_ATR_MULT = 0.5;
-const PROP_FUND_TP_ATR_MULT = 3.0;
-
 // ─── Signal Check Intervals ─────────────────────────────────────────────────
 
 /** How often to check for signals during the active London/NY session. */
@@ -89,20 +81,9 @@ const SIGNAL_CHECK_IN_SESSION_MS = 15 * 60 * 1000;   // 15 minutes
 /** How often to check for signals outside the active session. */
 const SIGNAL_CHECK_OUT_SESSION_MS = 60 * 60 * 1000;  // 60 minutes
 
-// ─── Phase 20 — Macro Regime Constants ──────────────────────────────────────
-
-/**
- * Minimum confidence score (0-100) a signal must carry AFTER applying the
- * regime confidence adjustment before it is forwarded to the correlation
- * limiter and routing layer.
- *
- * Raising the floor from ~40 (raw signal generator minimum) to 80 ensures
- * only high-conviction, macro-aligned setups are traded on the prop fund.
- * The base scoring in SignalGenerator can still reach 80+ when RSI + EMA +
- * support + MACD all align; the regime bonus (+10) pushes borderline 70-79
- * scores over the line when macro is supportive.
- */
-const MACRO_CONF_FLOOR = 80;
+// Phase 21: SL/TP multipliers and confidence floor are now internal to
+// generateSignalsV2() via the VolatilityEngine and MetaConfidence engines.
+// They are no longer set as constants here.
 
 // ─── Global State ───────────────────────────────────────────────────────────
 
@@ -143,6 +124,23 @@ const PIP_SIZES: Record<string, number> = {
 
 // Per-instrument cooldown tracking — maps instrument → last signal timestamp
 const instrumentLastSignal: Map<string, number> = new Map();
+
+// ── Phase 21 — Last signal metadata store ────────────────────────────────────
+// Populated by generateAndProcessSignals() for each V2 signal produced.
+// Exposed via /api/last-signals for the dashboard cards.
+export interface SignalMetadata {
+  instrument: string;
+  side: string;
+  stateScore: number;
+  stateLabel: string;
+  volatilityState: string;
+  regimeAlignment: string;
+  metaConfidence: number;
+  executionTier: string;
+  macroRegime: string;
+  timestamp: string;
+}
+export const lastSignalMeta: Map<string, SignalMetadata> = new Map();
 
 // Prop fund tracker — persists daily P&L summaries to data/prop-fund-tracker.json
 const propFundTracker = new PropFundTracker();
@@ -393,86 +391,88 @@ async function generateAndProcessSignals(): Promise<void> {
       }
     }
 
-    // ── Phase 20: Collect all candidate signals across instruments ───────────
-    // We gather ALL signals first so the correlation limiter can compare
-    // confidence scores across the full instrument set before any signal is routed.
+    // ── Phase 21: Collect all candidate signals across instruments (V2 path) ─
+    // generateSignalsV2() internalises the macro gate, regime alignment,
+    // adaptive SL/TP, and execution tier.  We still apply the correlation
+    // limiter across the full instrument set after collection.
     const candidates: TradeSignal[] = [];
-    let macroBlockCount = 0;
-    let confFloorCount  = 0;
 
     for (const instrument of instrumentList) {
       try {
         // Per-instrument cooldown — skip if the signal interval hasn't elapsed
         if (!isInstrumentCooledDown(instrument)) continue;
 
+        // ── Step 6: Fetch primary + extra timeframes ──────────────────────────
         const candles = await account.adapter.getCandles(instrument, '5m', 250);
-        const rawSignals = signalGenerator.generateSignals(instrument, candles);
+
+        // 4H and daily candles for the volatility surface.
+        // Graceful degradation: if the adapter doesn't expose these timeframes
+        // (or the provider is unavailable), V2 estimates from the 1H ATR.
+        let candles4h: Awaited<ReturnType<typeof account.adapter.getCandles>> | undefined;
+        let candles1d: Awaited<ReturnType<typeof account.adapter.getCandles>> | undefined;
+        try {
+          candles4h = await account.adapter.getCandles(instrument, '4h', 50);
+        } catch { /* provider doesn't support 4H — volatility engine will estimate */ }
+        try {
+          candles1d = await account.adapter.getCandles(instrument, '1d', 50);
+        } catch { /* provider doesn't support 1D — volatility engine will estimate */ }
+
+        // ── V2 signal generation (all internal gates applied) ─────────────────
+        const rawSignals = signalGenerator.generateSignalsV2(
+          instrument,
+          candles,
+          { candles4h, candles1d },
+          currentMacroRegime
+        );
 
         for (const signal of rawSignals) {
+          // Anchor entry to the live simulated price (preserving the adaptive
+          // stop distance computed by the volatility engine).
           const currentPrice = simulatedPrices.get(instrument);
           if (currentPrice) {
-            const atrVal = signal.indicator_values.atr_14;
-
-            // Apply prop-fund SL/TP overrides (0.5×ATR stop, 3×ATR target → 6:1 R:R)
-            if (isPropFund) {
-              signal.entry_price      = currentPrice;
-              signal.stop_loss        = signal.side === 'buy'
-                ? currentPrice - atrVal * PROP_FUND_SL_ATR_MULT
-                : currentPrice + atrVal * PROP_FUND_SL_ATR_MULT;
-              signal.take_profit      = signal.side === 'buy'
-                ? currentPrice + atrVal * PROP_FUND_TP_ATR_MULT
-                : currentPrice - atrVal * PROP_FUND_TP_ATR_MULT;
-              signal.risk_reward_ratio = PROP_FUND_TP_ATR_MULT / PROP_FUND_SL_ATR_MULT;
-            } else {
-              signal.entry_price = currentPrice;
-              signal.stop_loss   = signal.side === 'buy'
-                ? currentPrice - atrVal * 1.5
-                : currentPrice + atrVal * 1.5;
-              signal.take_profit = signal.side === 'buy'
-                ? currentPrice + atrVal * 2.5
-                : currentPrice - atrVal * 2.5;
-            }
+            const stopDist = Math.abs(signal.entry_price - signal.stop_loss);
+            const tpDist   = Math.abs(signal.take_profit  - signal.entry_price);
+            signal.entry_price  = parseFloat(currentPrice.toFixed(5));
+            signal.stop_loss    = parseFloat(
+              (signal.side === 'buy'
+                ? currentPrice - stopDist
+                : currentPrice + stopDist).toFixed(5)
+            );
+            signal.take_profit  = parseFloat(
+              (signal.side === 'buy'
+                ? currentPrice + tpDist
+                : currentPrice - tpDist).toFixed(5)
+            );
           }
 
-          // ── Phase 20 Step 4: Macro regime HARD gate ────────────────────────
-          // Discard signals that are directionally opposed to the macro regime.
-          if (isDirectionBlocked(signal.instrument, signal.side, currentMacroRegime)) {
-            macroBlockCount++;
-            logger.debug(`[macro-gate] ${signal.instrument} ${signal.side} blocked by ${currentMacroRegime}`);
-            continue;
-          }
-
-          // ── Phase 20 Step 5: Regime confidence adjustment ──────────────────
-          // +10 if signal aligns with macro tailwind; −10 if headwind.
-          const confAdj = getRegimeConfidenceAdjustment(
-            signal.instrument, signal.side, currentMacroRegime
-          );
-          signal.confidence = Math.max(0, Math.min(100, signal.confidence + confAdj));
-
-          // Confidence floor — reject signals that don't meet the bar even with
-          // a +10 regime bonus.  This ensures only high-conviction, macro-aligned
-          // setups proceed to execution.
-          if (signal.confidence < MACRO_CONF_FLOOR) {
-            confFloorCount++;
-            logger.debug(`[conf-floor] ${signal.instrument} ${signal.side} conf=${signal.confidence} < ${MACRO_CONF_FLOOR}`);
-            continue;
-          }
-
-          // Mark cooldown for all instruments that generated a qualifying signal
-          // (even if later demoted by the correlation limiter) so we don't re-check
-          // the same instrument until the cooldown elapses.
           markInstrumentSignaled(instrument);
           candidates.push(signal);
+
+          // Update last-signal metadata store for dashboard cards
+          if (signal.execution_tier && signal.execution_tier !== 'NO_TRADE') {
+            lastSignalMeta.set(instrument, {
+              instrument,
+              side:             signal.side,
+              stateScore:       signal.state_score ?? 0,
+              stateLabel:       signal.state_label ?? 'UNKNOWN',
+              volatilityState:  signal.volatility_state ?? 'NORMAL',
+              regimeAlignment:  signal.regime_alignment ?? 'NEUTRAL',
+              metaConfidence:   signal.meta_confidence ?? 0,
+              executionTier:    signal.execution_tier,
+              macroRegime:      currentMacroRegime,
+              timestamp:        signal.timestamp,
+            });
+          }
         }
       } catch (error) {
         logger.error(`Signal gen failed for ${instrument}`, { error });
       }
     }
 
-    // Log macro filter summary
-    if (macroBlockCount > 0 || confFloorCount > 0) {
-      logger.info(`[macro-filter] regime=${currentMacroRegime} blocked=${macroBlockCount} belowFloor=${confFloorCount} candidates=${candidates.length}`, {
+    if (candidates.length > 0) {
+      logger.info(`[v2-analyst] regime=${currentMacroRegime} candidates=${candidates.length}`, {
         sessionTag,
+        tiers: candidates.map(s => `${s.instrument}:${s.execution_tier ?? 'legacy'}`),
       });
     }
 
@@ -510,11 +510,11 @@ async function generateAndProcessSignals(): Promise<void> {
         continue;
       }
 
-      logger.info(`Signal [${sessionTag}]: ${signal.side} ${signal.instrument} conf=${signal.confidence} regime=${currentMacroRegime}`, {
+      logger.info(`Signal [${sessionTag}]: ${signal.side} ${signal.instrument} conf=${signal.confidence} tier=${signal.execution_tier ?? 'legacy'} regime=${currentMacroRegime}`, {
         factors:   signal.confluence_factors,
         isPropFund,
-        slAtrMult: isPropFund ? PROP_FUND_SL_ATR_MULT : 1.5,
-        tpAtrMult: isPropFund ? PROP_FUND_TP_ATR_MULT : 2.5,
+        volState:  signal.volatility_state,
+        stateScore: signal.state_score,
       });
 
       const results = await accountManager.routeSignal(signal);
@@ -630,14 +630,14 @@ async function main(): Promise<void> {
     }
   }
 
-  // Start the dashboard (passes propFundTracker for readiness endpoint)
-  const dashboardServer = startDashboard(accountManager, config.dashboardPort, propFundTracker);
+  // Start the dashboard (passes propFundTracker for readiness + lastSignalMeta for V2 cards)
+  const dashboardServer = startDashboard(accountManager, config.dashboardPort, propFundTracker, lastSignalMeta);
   logger.info(`Dashboard: http://localhost:${config.dashboardPort}`);
 
   // Start the main loop
   isRunning = true;
   logger.info('Engine started — price simulation active');
-  logger.info(`Prop fund session gate: ${SESSION_START_UTC}:00–${SESSION_END_UTC}:00 UTC | SL=${PROP_FUND_SL_ATR_MULT}×ATR | TP=${PROP_FUND_TP_ATR_MULT}×ATR`);
+  logger.info(`Prop fund session gate: ${SESSION_START_UTC}:00–${SESSION_END_UTC}:00 UTC | SL/TP adaptive via VolatilityEngine (Phase 21)`);
 
   const interval = setInterval(async () => {
     if (!isRunning) {
