@@ -35,6 +35,14 @@ export class DrawdownMonitor {
   private readonly WARNING_THRESHOLD = 0.80;   // 80% of drawdown consumed
   private readonly CRITICAL_THRESHOLD = 0.90;  // 90% → full lockout
 
+  // One-shot emission flags — each state transition fires its event exactly once.
+  // Without these, every call to calculateState() re-emits while breached,
+  // which fires the kill switch dozens of times per minute (event storm).
+  private hasEmittedWarning  = false;
+  private hasEmittedCritical = false;
+  private hasEmittedBreach   = false;
+  private lastHeartbeatMs    = 0;               // Rate-limit the heartbeat log
+
   constructor(profile: FirmProfile, initialBalance: number) {
     this.model = profile.drawdown_model;
     this.initialBalance = initialBalance;
@@ -138,25 +146,64 @@ export class DrawdownMonitor {
     const isCritical = consumedPct >= this.CRITICAL_THRESHOLD && consumedPct < 1.0;
     const isBreached = currentEquity <= this.floor;
 
-    // Emit events
+    // Emit events — one-shot per state transition to prevent event storms.
+    // Each flag is set on first emission and only cleared on reset/recovery.
     if (isBreached) {
-      eventBus.emitEngine({
-        type: 'KILL_SWITCH_TRIGGERED',
-        reason: `Max drawdown breached. Equity ${currentEquity.toFixed(2)} <= floor ${this.floor.toFixed(2)}`,
-        timestamp: new Date().toISOString()
-      });
-    } else if (isCritical) {
-      eventBus.emitEngine({
-        type: 'DRAWDOWN_CRITICAL',
-        level: consumedPct,
-        remaining_pct: 1 - consumedPct
-      });
-    } else if (isWarning) {
-      eventBus.emitEngine({
-        type: 'DRAWDOWN_WARNING',
-        level: consumedPct,
-        remaining_pct: 1 - consumedPct
-      });
+      if (!this.hasEmittedBreach) {
+        this.hasEmittedBreach = true;
+        riskLogger.error('[drawdown-monitor] BREACH — equity below floor. Trading halted.', {
+          currentEquity: currentEquity.toFixed(2),
+          floor: this.floor.toFixed(2),
+          model: this.model
+        });
+        eventBus.emitEngine({
+          type: 'KILL_SWITCH_TRIGGERED',
+          reason: `Max drawdown breached. Equity ${currentEquity.toFixed(2)} <= floor ${this.floor.toFixed(2)}`,
+          timestamp: new Date().toISOString()
+        });
+      } else {
+        // Heartbeat log once per minute while locked — not every 2s tick
+        if (Date.now() - this.lastHeartbeatMs > 60_000) {
+          this.lastHeartbeatMs = Date.now();
+          riskLogger.debug('[drawdown-monitor] Still locked — equity below floor', {
+            currentEquity: currentEquity.toFixed(2),
+            floor: this.floor.toFixed(2)
+          });
+        }
+      }
+    } else {
+      // Equity recovered above floor — reset breach flag so it re-fires if
+      // the floor is breached again after a reset or new peak.
+      if (this.hasEmittedBreach) {
+        this.hasEmittedBreach = false;
+        riskLogger.info('[drawdown-monitor] Equity recovered above floor', {
+          currentEquity: currentEquity.toFixed(2),
+          floor: this.floor.toFixed(2)
+        });
+      }
+
+      if (isCritical && !this.hasEmittedCritical) {
+        this.hasEmittedCritical = true;
+        this.hasEmittedWarning  = true; // Critical implies warning
+        eventBus.emitEngine({
+          type: 'DRAWDOWN_CRITICAL',
+          level: consumedPct,
+          remaining_pct: 1 - consumedPct
+        });
+      } else if (!isCritical && this.hasEmittedCritical) {
+        this.hasEmittedCritical = false; // Recovered from critical
+      }
+
+      if (isWarning && !this.hasEmittedWarning) {
+        this.hasEmittedWarning = true;
+        eventBus.emitEngine({
+          type: 'DRAWDOWN_WARNING',
+          level: consumedPct,
+          remaining_pct: 1 - consumedPct
+        });
+      } else if (!isWarning && this.hasEmittedWarning) {
+        this.hasEmittedWarning = false; // Recovered from warning
+      }
     }
 
     return {
@@ -204,5 +251,28 @@ export class DrawdownMonitor {
   /** Get the drawdown model */
   getModel(): DrawdownModel {
     return this.model;
+  }
+
+  /**
+   * Returns true if current equity is genuinely below the floor.
+   * Use this to decide whether to auto-reset the kill switch after a pip-calc
+   * fix or other correction.
+   */
+  isCurrentlyBreached(currentEquity: number): boolean {
+    return currentEquity <= this.floor;
+  }
+
+  /**
+   * Reset all one-shot emission flags. Called:
+   *   - On daily reset (a new trading day is a clean slate for warnings)
+   *   - After an operator-acknowledged kill switch reset
+   * Does NOT reset the floor or peak — those are risk rails, not counters.
+   */
+  resetEmissionFlags(): void {
+    this.hasEmittedWarning  = false;
+    this.hasEmittedCritical = false;
+    this.hasEmittedBreach   = false;
+    this.lastHeartbeatMs    = 0;
+    riskLogger.info('[drawdown-monitor] Emission flags reset');
   }
 }

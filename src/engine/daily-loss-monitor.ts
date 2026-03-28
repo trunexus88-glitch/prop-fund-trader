@@ -50,6 +50,11 @@ export class DailyLossMonitor {
   private readonly NO_NEW_TRADES_THRESHOLD = 0.70;   // 70% consumed
   private readonly FLATTEN_ALL_THRESHOLD = 0.85;      // 85% consumed
 
+  // One-shot emission flags — prevent event storm if daily loss stays breached
+  private hasEmittedWarning  = false;
+  private hasEmittedCritical = false;
+  private hasEmittedBreach   = false;
+
   constructor(profile: FirmProfile, initialBalance: number, currentEquity?: number) {
     this.dailyLossPct = profile.daily_loss_pct;
     this.basis = profile.daily_loss_basis;
@@ -99,6 +104,10 @@ export class DailyLossMonitor {
     this.closedPnlToday = 0;
     this.lastResetDate = today;
     this.dailyLimit = this.calculateDailyLimit();
+    // Clear one-shot flags — new trading day, fresh limits
+    this.hasEmittedWarning  = false;
+    this.hasEmittedCritical = false;
+    this.hasEmittedBreach   = false;
 
     riskLogger.info('Daily loss limit reset', {
       date: today,
@@ -144,23 +153,29 @@ export class DailyLossMonitor {
     const isCritical = consumedPct >= this.FLATTEN_ALL_THRESHOLD && consumedPct < 1.0;
     const isBreached = consumedPct >= 1.0;
 
-    // Emit events
+    // Emit events — one-shot per state transition (same pattern as DrawdownMonitor).
     if (isBreached) {
-      eventBus.emitEngine({
-        type: 'KILL_SWITCH_TRIGGERED',
-        reason: `Daily loss limit breached. Loss ${dailyLossUsed.toFixed(2)} >= limit ${this.dailyLimit.toFixed(2)}`,
-        timestamp: new Date().toISOString()
-      });
-    } else if (isCritical) {
-      eventBus.emitEngine({
-        type: 'DAILY_LOSS_CRITICAL',
-        used_pct: consumedPct
-      });
-    } else if (isWarning) {
-      eventBus.emitEngine({
-        type: 'DAILY_LOSS_WARNING',
-        used_pct: consumedPct
-      });
+      if (!this.hasEmittedBreach) {
+        this.hasEmittedBreach   = true;
+        this.hasEmittedCritical = true;
+        this.hasEmittedWarning  = true;
+        riskLogger.error('[daily-loss-monitor] BREACH — daily loss limit hit. Trading halted.', {
+          lossUsed: dailyLossUsed.toFixed(2),
+          limit: this.dailyLimit.toFixed(2)
+        });
+        eventBus.emitEngine({
+          type: 'KILL_SWITCH_TRIGGERED',
+          reason: `Daily loss limit breached. Loss ${dailyLossUsed.toFixed(2)} >= limit ${this.dailyLimit.toFixed(2)}`,
+          timestamp: new Date().toISOString()
+        });
+      }
+    } else if (isCritical && !this.hasEmittedCritical) {
+      this.hasEmittedCritical = true;
+      this.hasEmittedWarning  = true;
+      eventBus.emitEngine({ type: 'DAILY_LOSS_CRITICAL', used_pct: consumedPct });
+    } else if (isWarning && !this.hasEmittedWarning) {
+      this.hasEmittedWarning = true;
+      eventBus.emitEngine({ type: 'DAILY_LOSS_WARNING', used_pct: consumedPct });
     }
 
     return {

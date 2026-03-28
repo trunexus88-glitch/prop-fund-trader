@@ -55,6 +55,13 @@ export class KillSwitch {
    * This is an irreversible action for the current session.
    */
   async trigger(reason: string): Promise<ClosedTrade[]> {
+    // If already triggered, do nothing — positions are already flat (or being flattened).
+    // Without this guard, a breached DrawdownMonitor emitting every 2s would call
+    // trigger() continuously even after positions are closed, filling error logs.
+    if (this.isTriggered) {
+      return [];
+    }
+
     if (this.isExecuting) {
       riskLogger.warn('Kill switch already executing, ignoring duplicate trigger');
       return [];

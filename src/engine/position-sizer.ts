@@ -24,9 +24,30 @@ export class PositionSizer {
   private isTrailing: boolean;
   private pipValue: number;            // Default pip value per lot
 
-  // Standard lot = 100,000 units, pip = 0.0001 for forex
+  // Standard lot = 100,000 units
   private readonly STANDARD_LOT_SIZE = 100_000;
-  private readonly DEFAULT_PIP = 0.0001;
+
+  /**
+   * Returns the pip size for an instrument.
+   *
+   * JPY pairs (USDJPY, EURJPY, GBPJPY, …) use 0.01 — one pip is the
+   * second decimal place on a ~150 price.  All other forex pairs and
+   * most CFDs use 0.0001 (fourth decimal place).
+   *
+   * Using the wrong value causes 100× errors in stop-distance-to-pips
+   * conversion, which cascades into wildly wrong position sizes and
+   * phantom P&L swings that can trigger the drawdown monitor on real data.
+   */
+  private getPipSize(instrument: string): number {
+    if (instrument.includes('JPY')) return 0.01;       // JPY pairs: pip = 0.01
+    if (instrument === 'XAUUSD') return 0.10;          // Gold: pip = $0.10
+    if (instrument === 'XAGUSD') return 0.01;          // Silver: pip = $0.01
+    if (instrument === 'BTCUSD') return 1.00;          // BTC: pip = $1
+    if (instrument === 'ETHUSD') return 0.10;          // ETH: pip = $0.10
+    if (instrument === 'USOIL')  return 0.01;          // Oil: pip = $0.01
+    if (/^(US30|NAS100|SPX500)$/.test(instrument)) return 1.0; // Indices
+    return 0.0001;                                     // All other forex pairs
+  }
 
   constructor(profile: FirmProfile, initialBalance: number) {
     this.initialBalance = initialBalance;
@@ -87,9 +108,10 @@ export class PositionSizer {
       };
     }
 
-    // 8. Calculate stop distance in pips
+    // 8. Calculate stop distance in pips (instrument-aware)
+    const pipSize = this.getPipSize(request.instrument);
     const stopDistance = Math.abs(request.entry_price - request.stop_loss);
-    const stopDistancePips = stopDistance / this.DEFAULT_PIP;
+    const stopDistancePips = stopDistance / pipSize;
 
     if (stopDistancePips <= 0) {
       return {
@@ -105,7 +127,7 @@ export class PositionSizer {
 
     // 9. Calculate lot size: risk_amount / (stop_pips × pip_value)
     const rawLots = riskAmount / (stopDistancePips * this.pipValue);
-    
+
     // 10. Round down to nearest 0.01 lot (micro lot)
     const lots = Math.floor(rawLots * 100) / 100;
 
@@ -127,7 +149,7 @@ export class PositionSizer {
 
     // 12. Worst case scenario: stop + 2x ATR slippage
     const worstCaseSlippage = request.atr * 2;
-    const worstCaseStopPips = (stopDistance + worstCaseSlippage) / this.DEFAULT_PIP;
+    const worstCaseStopPips = (stopDistance + worstCaseSlippage) / pipSize;
     const maxLossScenario = lots * worstCaseStopPips * this.pipValue;
 
     // 13. Final safety check: worst case should not breach daily or max DD

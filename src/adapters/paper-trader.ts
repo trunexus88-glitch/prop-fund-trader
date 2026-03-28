@@ -25,6 +25,8 @@ export class PaperTradingAdapter implements TradingAdapter {
   private candleStore: Map<string, Candle[]> = new Map();
   private spread: number = 0.00015; // 1.5 pip spread for simulation
   private tradeIdCounter: number = 0;
+  // Registered price-update callbacks (see onPriceUpdate)
+  _priceCallbacks: Map<string, Array<(p: { bid: number; ask: number }) => void>> = new Map();
 
   constructor(initialBalance: number) {
     this.balance = initialBalance;
@@ -177,12 +179,26 @@ export class PaperTradingAdapter implements TradingAdapter {
   }
 
   onPriceUpdate(instrument: string, callback: (price: { bid: number; ask: number }) => void): void {
-    // In paper trading, we simulate periodic price updates
-    // This would be connected to a real data feed in production
+    // Register a callback for price updates on this instrument.
+    // In paper trading mode the main loop calls updatePrice() directly —
+    // so we store the callback and fire it from updatePrice() each tick.
+    // On a live adapter (MT5Adapter) this would subscribe to the broker's
+    // WebSocket or REST poll, then call registered callbacks as ticks arrive.
+    if (!this._priceCallbacks) {
+      this._priceCallbacks = new Map<string, Array<(p: { bid: number; ask: number }) => void>>();
+    }
+    if (!this._priceCallbacks.has(instrument)) {
+      this._priceCallbacks.set(instrument, []);
+    }
+    this._priceCallbacks.get(instrument)!.push(callback);
   }
 
-  onPositionUpdate(callback: (position: Position) => void): void {
-    // Simulated position updates
+  onPositionUpdate(_callback: (position: Position) => void): void {
+    // TODO (Phase 19): On live adapters this will subscribe to broker position
+    // events (fills, SL/TP triggers, margin calls) and push them to the
+    // AccountManager so the internal state stays in sync without polling.
+    // In paper mode, positions are updated synchronously inside updatePrice()
+    // (SL/TP execution is immediate) so push notifications aren't needed.
   }
 
   // ─── Paper Trading Specific Methods ─────────────────────────────────
@@ -192,6 +208,12 @@ export class PaperTradingAdapter implements TradingAdapter {
    */
   updatePrice(instrument: string, bid: number, ask: number): void {
     this.priceFeeds.set(instrument, { bid, ask });
+
+    // Notify any registered onPriceUpdate subscribers
+    const cbs = this._priceCallbacks.get(instrument);
+    if (cbs) {
+      for (const cb of cbs) cb({ bid, ask });
+    }
 
     // Update all open positions for this instrument
     for (const pos of this.positions.values()) {
@@ -299,11 +321,31 @@ export class PaperTradingAdapter implements TradingAdapter {
     return order.price || (order.side === 'buy' ? feed.ask : feed.bid);
   }
 
+  /**
+   * Returns the pip size for an instrument.
+   * Must match position-sizer.ts getPipSize() — keep them in sync.
+   *
+   * JPY pairs use 0.01 (not 0.0001). Using 0.0001 for USDJPY makes a
+   * 50-pip move appear as 5,000 pips, producing phantom $50,000 P&L per lot
+   * that would immediately breach every drawdown floor on live data.
+   */
+  private getPipSize(instrument: string): number {
+    if (instrument.includes('JPY')) return 0.01;
+    if (instrument === 'XAUUSD') return 0.10;
+    if (instrument === 'XAGUSD') return 0.01;
+    if (instrument === 'BTCUSD') return 1.00;
+    if (instrument === 'ETHUSD') return 0.10;
+    if (instrument === 'USOIL')  return 0.01;
+    if (/^(US30|NAS100|SPX500)$/.test(instrument)) return 1.0;
+    return 0.0001;
+  }
+
   private calculatePnl(position: Position, exitPrice: number): number {
     const direction = position.side === 'buy' ? 1 : -1;
     const priceDiff = (exitPrice - position.entry_price) * direction;
-    const pipDiff = priceDiff / 0.0001;
-    return pipDiff * 10 * position.lots; // $10 per pip per lot
+    const pipSize   = this.getPipSize(position.instrument);
+    const pipDiff   = priceDiff / pipSize;
+    return pipDiff * 10 * position.lots; // $10 per pip per standard lot
   }
 
   private async executeStopLoss(positionId: string, price: number): Promise<void> {

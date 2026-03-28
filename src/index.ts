@@ -321,14 +321,26 @@ async function generateAndProcessSignals(): Promise<void> {
     }
 
     // ── Prop fund daily loss cutoff ──────────────────────────────────────────
+    // Include BOTH realized (closed) AND floating (unrealized) P&L.
+    // Prop firm rules count all open exposure toward the daily limit — a position
+    // that's deeply underwater counts against the limit even before it's closed.
+    // Checking only realized P&L could allow opening new trades while already at
+    // 99% of the daily limit via open floating losses.
     if (isPropFund) {
-      const todayPnL = account.state.closed_trades_today.reduce(
+      const realizedPnL  = account.state.closed_trades_today.reduce(
         (s, t) => s + t.realized_pnl, 0
       );
-      if (!canOpenNewTrade(todayPnL, PROP_FUND_RULES)) {
+      const floatingPnL  = account.state.open_positions.reduce(
+        (s, p) => s + p.unrealized_pnl, 0
+      );
+      const totalDailyPnL = realizedPnL + floatingPnL;
+
+      if (!canOpenNewTrade(totalDailyPnL, PROP_FUND_RULES)) {
         riskLogger.warn(`[${firmId}] Prop fund daily loss cutoff reached — no new trades`, {
-          todayPnL: todayPnL.toFixed(2),
-          cutoff: (PROP_FUND_RULES.dailyLossCutoffPct * PROP_FUND_RULES.accountSize).toFixed(2),
+          realizedPnL: realizedPnL.toFixed(2),
+          floatingPnL: floatingPnL.toFixed(2),
+          totalDailyPnL: totalDailyPnL.toFixed(2),
+          cutoff: `-$${(PROP_FUND_RULES.dailyLossCutoffPct * PROP_FUND_RULES.accountSize).toFixed(2)}`,
         });
         continue;
       }
@@ -404,7 +416,13 @@ async function generateAndProcessSignals(): Promise<void> {
         logger.error(`Signal gen failed for ${instrument}`, { error });
       }
     }
-    break; // Only generate from one data source
+    // Intentional break: we use the FIRST active account as the sole candle
+    // data source for all signals. Generating signals independently per account
+    // would produce correlated-but-slightly-different entries across accounts
+    // (due to price feed timing) which the cross-account hedging check in
+    // AccountManager interprets as hedging attempts. One signal source →
+    // one set of confluence decisions → routed to all eligible accounts.
+    break;
   }
 }
 
