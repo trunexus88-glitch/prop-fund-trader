@@ -35,6 +35,12 @@ import {
   getDrawdownSizeMultiplier,
   canOpenNewTrade,
 } from './engine/prop-fund-rules.js';
+// Phase 20 — Intermarket Correlation Engine
+import { getMacroSnapshot } from './core/lib/macro-provider.js';
+import { classifyMacroRegime, logMacroRegime, macroRegimeColor } from './strategy/macro-regime-classifier.js';
+import type { MacroRegimeState } from './strategy/macro-regime-classifier.js';
+import { isDirectionBlocked, getRegimeConfidenceAdjustment } from './strategy/asset-clusters.js';
+import { applyCorrelationLimit } from './strategy/correlation-limiter.js';
 import type { FirmProfile, TradeSignal, EngineEvent } from './engine/types.js';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -83,6 +89,21 @@ const SIGNAL_CHECK_IN_SESSION_MS = 15 * 60 * 1000;   // 15 minutes
 /** How often to check for signals outside the active session. */
 const SIGNAL_CHECK_OUT_SESSION_MS = 60 * 60 * 1000;  // 60 minutes
 
+// ─── Phase 20 — Macro Regime Constants ──────────────────────────────────────
+
+/**
+ * Minimum confidence score (0-100) a signal must carry AFTER applying the
+ * regime confidence adjustment before it is forwarded to the correlation
+ * limiter and routing layer.
+ *
+ * Raising the floor from ~40 (raw signal generator minimum) to 80 ensures
+ * only high-conviction, macro-aligned setups are traded on the prop fund.
+ * The base scoring in SignalGenerator can still reach 80+ when RSI + EMA +
+ * support + MACD all align; the regime bonus (+10) pushes borderline 70-79
+ * scores over the line when macro is supportive.
+ */
+const MACRO_CONF_FLOOR = 80;
+
 // ─── Global State ───────────────────────────────────────────────────────────
 
 let isRunning = false;
@@ -90,6 +111,11 @@ let tickCount = 0;
 let lastRegimeUpdate = 0;
 let lastSignalCheck = 0;
 let lastDailyReview = '';
+
+/** Current macro regime — updated every REGIME_UPDATE_INTERVAL_MS alongside candle regime. */
+let currentMacroRegime: MacroRegimeState = 'NEUTRAL';
+/** Hex colour string for the latest macro regime (for dashboard WS push). */
+let currentMacroRegimeColor = '#94a3b8';  // slate = NEUTRAL
 
 // Track simulated prices per instrument — walks randomly from a starting point
 const simulatedPrices: Map<string, number> = new Map();
@@ -274,18 +300,21 @@ async function tick(): Promise<void> {
 }
 
 function logSummary(): void {
+  const sessionTag = isInSession() ? '[IN SESSION 🟢]' : '[OUT SESSION 🔵]';
+  logger.info(`[macro] Regime: ${currentMacroRegime} ${sessionTag}`);
+
   for (const [firmId, account] of accountManager.getAccounts()) {
     if (account.status !== 'active') continue;
     const pnl = account.state.current_balance - account.profile.account_size;
     const openCount = account.state.open_positions.length;
     const closedToday = account.state.closed_trades_today.length;
 
-    const sessionTag = isInSession() ? '[IN SESSION 🟢]' : '[OUT SESSION 🔵]';
     logger.info(`[${firmId}] ${sessionTag} Balance: $${account.state.current_balance.toFixed(2)} | P&L: $${pnl.toFixed(2)} | Open: ${openCount} | Closed today: ${closedToday}`);
   }
 }
 
 async function updateRegime(): Promise<void> {
+  // ── Candle-based local regime (trending/ranging/volatile) ────────────────
   for (const [, account] of accountManager.getAccounts()) {
     if (account.status !== 'active') continue;
 
@@ -294,11 +323,29 @@ async function updateRegime(): Promise<void> {
       const regime = regimeClassifier.classify(candles);
       signalGenerator.setRegime(regime.regime);
 
-      logger.info(`Regime: ${regime.regime} (${regime.confidence.toFixed(1)}% confidence)`);
+      logger.info(`Candle regime: ${regime.regime} (${regime.confidence.toFixed(1)}%)`);
     } catch (error) {
-      logger.error('Regime update failed', { error });
+      logger.error('Candle regime update failed', { error });
     }
-    break;
+    break; // First active account is the single candle source
+  }
+
+  // ── Macro regime (DXY / US10Y / USOIL intermarket) ──────────────────────
+  // getMacroSnapshot() caches for 15 min — this call is cheap on most ticks.
+  try {
+    const macro      = await getMacroSnapshot();
+    const newRegime  = classifyMacroRegime(macro);
+
+    if (newRegime !== currentMacroRegime) {
+      logMacroRegime(newRegime, macro);
+      logger.info(`Macro regime changed: ${currentMacroRegime} → ${newRegime}`, {
+        fallback: macro.is_fallback,
+      });
+      currentMacroRegime      = newRegime;
+      currentMacroRegimeColor = macroRegimeColor(newRegime);
+    }
+  } catch (error) {
+    logger.warn('Macro regime update failed — keeping previous regime', { error, currentMacroRegime });
   }
 }
 
@@ -337,85 +384,148 @@ async function generateAndProcessSignals(): Promise<void> {
 
       if (!canOpenNewTrade(totalDailyPnL, PROP_FUND_RULES)) {
         riskLogger.warn(`[${firmId}] Prop fund daily loss cutoff reached — no new trades`, {
-          realizedPnL: realizedPnL.toFixed(2),
-          floatingPnL: floatingPnL.toFixed(2),
-          totalDailyPnL: totalDailyPnL.toFixed(2),
+          realizedPnL:    realizedPnL.toFixed(2),
+          floatingPnL:    floatingPnL.toFixed(2),
+          totalDailyPnL:  totalDailyPnL.toFixed(2),
           cutoff: `-$${(PROP_FUND_RULES.dailyLossCutoffPct * PROP_FUND_RULES.accountSize).toFixed(2)}`,
         });
         continue;
       }
     }
 
+    // ── Phase 20: Collect all candidate signals across instruments ───────────
+    // We gather ALL signals first so the correlation limiter can compare
+    // confidence scores across the full instrument set before any signal is routed.
+    const candidates: TradeSignal[] = [];
+    let macroBlockCount = 0;
+    let confFloorCount  = 0;
+
     for (const instrument of instrumentList) {
       try {
-        // ── Per-instrument cooldown check ───────────────────────────────────
-        if (!isInstrumentCooledDown(instrument)) {
-          continue;
-        }
+        // Per-instrument cooldown — skip if the signal interval hasn't elapsed
+        if (!isInstrumentCooledDown(instrument)) continue;
 
-        // Build candles from simulated prices
         const candles = await account.adapter.getCandles(instrument, '5m', 250);
-        const signals = signalGenerator.generateSignals(instrument, candles);
+        const rawSignals = signalGenerator.generateSignals(instrument, candles);
 
-        for (const signal of signals) {
+        for (const signal of rawSignals) {
           const currentPrice = simulatedPrices.get(instrument);
           if (currentPrice) {
-            const atr = signal.indicator_values.atr_14;
+            const atrVal = signal.indicator_values.atr_14;
 
-            // ── Prop fund SL/TP: 0.5×ATR stop, 3×ATR target (6:1 R:R) ─────
+            // Apply prop-fund SL/TP overrides (0.5×ATR stop, 3×ATR target → 6:1 R:R)
             if (isPropFund) {
-              signal.entry_price = currentPrice;
-              signal.stop_loss = signal.side === 'buy'
-                ? currentPrice - atr * PROP_FUND_SL_ATR_MULT
-                : currentPrice + atr * PROP_FUND_SL_ATR_MULT;
-              signal.take_profit = signal.side === 'buy'
-                ? currentPrice + atr * PROP_FUND_TP_ATR_MULT
-                : currentPrice - atr * PROP_FUND_TP_ATR_MULT;
+              signal.entry_price      = currentPrice;
+              signal.stop_loss        = signal.side === 'buy'
+                ? currentPrice - atrVal * PROP_FUND_SL_ATR_MULT
+                : currentPrice + atrVal * PROP_FUND_SL_ATR_MULT;
+              signal.take_profit      = signal.side === 'buy'
+                ? currentPrice + atrVal * PROP_FUND_TP_ATR_MULT
+                : currentPrice - atrVal * PROP_FUND_TP_ATR_MULT;
               signal.risk_reward_ratio = PROP_FUND_TP_ATR_MULT / PROP_FUND_SL_ATR_MULT;
             } else {
-              // Standard settings for non-prop-fund accounts
               signal.entry_price = currentPrice;
-              signal.stop_loss = signal.side === 'buy'
-                ? currentPrice - atr * 1.5
-                : currentPrice + atr * 1.5;
+              signal.stop_loss   = signal.side === 'buy'
+                ? currentPrice - atrVal * 1.5
+                : currentPrice + atrVal * 1.5;
               signal.take_profit = signal.side === 'buy'
-                ? currentPrice + atr * 2.5
-                : currentPrice - atr * 2.5;
+                ? currentPrice + atrVal * 2.5
+                : currentPrice - atrVal * 2.5;
             }
           }
 
-          logger.info(`Signal [${sessionTag}]: ${signal.side} ${signal.instrument} conf=${signal.confidence}`, {
-            factors: signal.confluence_factors,
-            isPropFund,
-            slAtrMult: isPropFund ? PROP_FUND_SL_ATR_MULT : 1.5,
-            tpAtrMult: isPropFund ? PROP_FUND_TP_ATR_MULT : 2.5,
-          });
-
-          // Check open position count before routing
-          let canRoute = true;
-          for (const [, acct] of accountManager.getAccounts()) {
-            const openPositions = await acct.adapter.getOpenPositions();
-            if (openPositions.length >= MAX_OPEN_POSITIONS_PER_ACCOUNT) {
-              canRoute = false;
-              break;
-            }
+          // ── Phase 20 Step 4: Macro regime HARD gate ────────────────────────
+          // Discard signals that are directionally opposed to the macro regime.
+          if (isDirectionBlocked(signal.instrument, signal.side, currentMacroRegime)) {
+            macroBlockCount++;
+            logger.debug(`[macro-gate] ${signal.instrument} ${signal.side} blocked by ${currentMacroRegime}`);
+            continue;
           }
 
-          if (canRoute) {
-            markInstrumentSignaled(instrument);
-            const results = await accountManager.routeSignal(signal);
-            for (const [routedFirmId, executed] of results) {
-              if (executed) {
-                signal.acted_upon = true;
-                logger.info(`✅ Executed on ${routedFirmId} [${sessionTag}]`);
-              }
-            }
+          // ── Phase 20 Step 5: Regime confidence adjustment ──────────────────
+          // +10 if signal aligns with macro tailwind; −10 if headwind.
+          const confAdj = getRegimeConfidenceAdjustment(
+            signal.instrument, signal.side, currentMacroRegime
+          );
+          signal.confidence = Math.max(0, Math.min(100, signal.confidence + confAdj));
+
+          // Confidence floor — reject signals that don't meet the bar even with
+          // a +10 regime bonus.  This ensures only high-conviction, macro-aligned
+          // setups proceed to execution.
+          if (signal.confidence < MACRO_CONF_FLOOR) {
+            confFloorCount++;
+            logger.debug(`[conf-floor] ${signal.instrument} ${signal.side} conf=${signal.confidence} < ${MACRO_CONF_FLOOR}`);
+            continue;
           }
+
+          // Mark cooldown for all instruments that generated a qualifying signal
+          // (even if later demoted by the correlation limiter) so we don't re-check
+          // the same instrument until the cooldown elapses.
+          markInstrumentSignaled(instrument);
+          candidates.push(signal);
         }
       } catch (error) {
         logger.error(`Signal gen failed for ${instrument}`, { error });
       }
     }
+
+    // Log macro filter summary
+    if (macroBlockCount > 0 || confFloorCount > 0) {
+      logger.info(`[macro-filter] regime=${currentMacroRegime} blocked=${macroBlockCount} belowFloor=${confFloorCount} candidates=${candidates.length}`, {
+        sessionTag,
+      });
+    }
+
+    if (candidates.length === 0) {
+      // Intentional break — see comment below
+      break;
+    }
+
+    // ── Phase 20 Step 6: Correlation limiter ──────────────────────────────────
+    // From each asset cluster, keep only the highest-confidence signal.
+    // This prevents simultaneous correlated losses (e.g. EURUSD SELL + GBPUSD SELL
+    // both triggered by the same USD strength move).
+    const { approved, blocked: correlationBlocked, clusterWinners } = applyCorrelationLimit(candidates);
+
+    if (correlationBlocked.length > 0) {
+      logger.info(`[corr-limiter] approved=${approved.length} demoted=${correlationBlocked.length}`, {
+        winners: Object.fromEntries(clusterWinners),
+      });
+    }
+
+    // ── Route approved signals ────────────────────────────────────────────────
+    for (const signal of approved) {
+      // Check open position cap across all accounts before routing
+      let canRoute = true;
+      for (const [, acct] of accountManager.getAccounts()) {
+        const openPositions = await acct.adapter.getOpenPositions();
+        if (openPositions.length >= MAX_OPEN_POSITIONS_PER_ACCOUNT) {
+          canRoute = false;
+          break;
+        }
+      }
+
+      if (!canRoute) {
+        logger.debug(`[route] ${signal.instrument} skipped — position cap reached`);
+        continue;
+      }
+
+      logger.info(`Signal [${sessionTag}]: ${signal.side} ${signal.instrument} conf=${signal.confidence} regime=${currentMacroRegime}`, {
+        factors:   signal.confluence_factors,
+        isPropFund,
+        slAtrMult: isPropFund ? PROP_FUND_SL_ATR_MULT : 1.5,
+        tpAtrMult: isPropFund ? PROP_FUND_TP_ATR_MULT : 2.5,
+      });
+
+      const results = await accountManager.routeSignal(signal);
+      for (const [routedFirmId, executed] of results) {
+        if (executed) {
+          signal.acted_upon = true;
+          logger.info(`✅ Executed on ${routedFirmId} [${sessionTag}]`);
+        }
+      }
+    }
+
     // Intentional break: we use the FIRST active account as the sole candle
     // data source for all signals. Generating signals independently per account
     // would produce correlated-but-slightly-different entries across accounts

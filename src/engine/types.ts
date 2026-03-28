@@ -190,6 +190,9 @@ export interface PositionSizeRequest {
   remaining_max_drawdown_headroom: number;
   current_open_exposure: number;              // Total lots already open
   is_funded: boolean;                         // Affects risk cap
+  // Phase 20 — total exposure cap (Step 7)
+  account_equity: number;                     // Current equity for 50% cap check
+  current_open_risk_usd: number;              // Sum of dollar risk on all open positions
 }
 
 export interface PositionSizeResult {
@@ -211,6 +214,9 @@ export interface DashboardSnapshot {
   uptime_seconds: number;
   signals_today: number;
   trades_today: number;
+  // Phase 20 additions
+  macro_regime?: string;                      // Current macro regime state
+  macro_regime_color?: string;               // Hex color for dashboard badge
 }
 
 export interface AccountDashboard {

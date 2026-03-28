@@ -191,6 +191,22 @@ export class AccountManager {
     const dailyHeadroom = account.dailyLossMonitor.getRemainingHeadroom(positions);
     const ddHeadroom = account.drawdownMonitor.getRemainingHeadroom(equity);
 
+    // Phase 20 (Step 7): compute total dollar risk already committed to open positions.
+    // Pip sizes mirror position-sizer.ts getPipSize() — keep the two in sync.
+    const openRiskUsd = positions.reduce((sum, pos) => {
+      let pipSize = 0.0001;
+      const sym = pos.instrument.toUpperCase();
+      if (sym.includes('JPY'))                           pipSize = 0.01;
+      else if (sym === 'XAUUSD')                         pipSize = 0.10;
+      else if (sym === 'XAGUSD')                         pipSize = 0.01;
+      else if (sym === 'BTCUSD')                         pipSize = 1.00;
+      else if (sym === 'ETHUSD')                         pipSize = 0.10;
+      else if (sym === 'USOIL')                          pipSize = 0.01;
+      else if (/^(US30|NAS100|SPX500)$/.test(sym))      pipSize = 1.0;
+      const stopPips = Math.abs(pos.entry_price - pos.stop_loss) / pipSize;
+      return sum + stopPips * 10 * pos.lots;    // $10 per pip per standard lot
+    }, 0);
+
     const sizeResult = account.positionSizer.calculate({
       instrument: signal.instrument,
       signal_confidence: signal.confidence,
@@ -200,7 +216,9 @@ export class AccountManager {
       remaining_daily_headroom: dailyHeadroom,
       remaining_max_drawdown_headroom: ddHeadroom,
       current_open_exposure: positions.reduce((s, p) => s + p.lots, 0),
-      is_funded: false // Will be determined by account type
+      is_funded: false,          // Will be determined by account type
+      account_equity: equity,    // Phase 20 — for 50% total exposure cap
+      current_open_risk_usd: openRiskUsd,
     });
 
     if (!sizeResult.approved) {

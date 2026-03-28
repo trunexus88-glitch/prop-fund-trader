@@ -16,6 +16,14 @@ import { logger } from '../utils/logger.js';
 import { eventBus } from '../utils/event-bus.js';
 import type { PropFundTracker } from '../engine/prop-fund-tracker.js';
 import { PROP_FUND_RULES } from '../engine/prop-fund-rules.js';
+// Phase 20 — macro regime dashboard data
+import { getMacroSnapshot } from '../core/lib/macro-provider.js';
+import {
+  classifyMacroRegime,
+  macroRegimeLabel,
+  macroRegimeColor,
+} from '../strategy/macro-regime-classifier.js';
+import { getCluster } from '../strategy/asset-clusters.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -94,6 +102,60 @@ export function startDashboard(
     res.json(account.state.all_closed_trades.slice(-100)); // Last 100 trades
   });
 
+  // ── Phase 20: Macro regime endpoint ─────────────────────────────────────
+  // Returns the current macro regime state with DXY/yields/oil driver values.
+  // The dashboard JS polls this every 60s to update the regime indicator badge.
+  app.get('/api/macro-regime', async (_req, res) => {
+    try {
+      const macro  = await getMacroSnapshot();
+      const regime = classifyMacroRegime(macro);
+
+      // Cluster exposure: count open positions per cluster across all accounts
+      const clusterExposure: Record<string, number> = {};
+      for (const [, account] of accountManager.getAccounts()) {
+        for (const pos of account.state.open_positions) {
+          const cluster = getCluster(pos.instrument);
+          clusterExposure[cluster] = (clusterExposure[cluster] ?? 0) + 1;
+        }
+      }
+
+      res.json({
+        regime,
+        label:           macroRegimeLabel(regime),
+        color:           macroRegimeColor(regime),
+        is_fallback:     macro.is_fallback,
+        fetched_at:      macro.fetchedAt,
+        drivers: {
+          dxy: {
+            price:  macro.dxy.price.toFixed(4),
+            ema20:  macro.dxy.ema20.toFixed(4),
+            trend:  macro.dxy.trend,
+            label:  'DXY Proxy (1/EURUSD)',
+          },
+          yields: {
+            price:  `${macro.yields.price.toFixed(2)}%`,
+            ema20:  `${macro.yields.ema20.toFixed(2)}%`,
+            trend:  macro.yields.trend,
+            label:  'US10Y Yield (^TNX)',
+          },
+          oil: {
+            price:  `$${macro.oil.price.toFixed(2)}`,
+            ema20:  `$${macro.oil.ema20.toFixed(2)}`,
+            trend:  macro.oil.trend,
+            label:  'WTI Crude (CL=F)',
+          },
+        },
+        cluster_exposure: clusterExposure,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      res.status(503).json({
+        error:   'Macro data unavailable',
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
   // WebSocket for real-time updates
   wss.on('connection', (ws: WebSocket) => {
     logger.info('Dashboard client connected');
@@ -148,13 +210,28 @@ async function buildSnapshot(accountManager: AccountManager): Promise<DashboardS
     tradesToday += account.state.closed_trades_today.length;
   }
 
+  // Phase 20 — attach macro regime to every WS snapshot push
+  // Using the cached snapshot (no await) so WS sends never block on network calls.
+  let macroRegime = 'NEUTRAL';
+  let macroRegimeColorStr = '#94a3b8';
+  try {
+    const macro = await getMacroSnapshot();
+    const regime = classifyMacroRegime(macro);
+    macroRegime        = regime;
+    macroRegimeColorStr = macroRegimeColor(regime);
+  } catch {
+    // Non-fatal — snapshot proceeds without macro data
+  }
+
   return {
     timestamp: new Date().toISOString(),
     accounts,
     system_status: 'running',
     uptime_seconds: process.uptime(),
     signals_today: signalsToday,
-    trades_today: tradesToday
+    trades_today: tradesToday,
+    macro_regime:       macroRegime,
+    macro_regime_color: macroRegimeColorStr,
   };
 }
 

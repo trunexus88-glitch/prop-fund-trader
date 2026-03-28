@@ -93,7 +93,31 @@ export class PositionSizer {
     const maxRiskFromDD = request.remaining_max_drawdown_headroom * 0.25; // Use at most 25% of remaining DD
 
     // 6. Take the minimum of all constraints
-    const riskAmount = Math.min(maxRiskFromCap, maxRiskFromDaily, maxRiskFromDD);
+    let riskAmount = Math.min(maxRiskFromCap, maxRiskFromDaily, maxRiskFromDD);
+
+    // 6b. Phase 20 — Total exposure cap: existing open risk + this trade ≤ 50% of equity.
+    // Prevents compounding risk when several positions are already open.
+    // Expressed in dollar risk (sum of (stopPips × $10/pip × lots) across all open positions).
+    if (request.account_equity > 0) {
+      const maxTotalRisk          = request.account_equity * 0.50;
+      const remainingRiskBudget   = maxTotalRisk - request.current_open_risk_usd;
+
+      if (remainingRiskBudget <= 0) {
+        riskLogger.warn('Total exposure cap reached — 50% of equity already at risk', {
+          accountEquity:    request.account_equity.toFixed(2),
+          openRiskUsd:      request.current_open_risk_usd.toFixed(2),
+          maxTotalRisk:     maxTotalRisk.toFixed(2),
+        });
+        return {
+          lots: 0, risk_amount: 0, risk_pct: 0,
+          stop_distance_pips: 0, max_loss_scenario: 0,
+          approved: false,
+          rejection_reason: 'Total exposure cap: 50% of equity is fully committed to open positions',
+        };
+      }
+
+      riskAmount = Math.min(riskAmount, remainingRiskBudget);
+    }
 
     // 7. If risk amount is too small, reject the trade
     if (riskAmount <= 0) {
