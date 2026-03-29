@@ -1,1 +1,18 @@
-[]
+[
+  {
+    "day": "2026-03-27",
+    "startEquity": 5000,
+    "endEquity": 4749.882664233243,
+    "dailyPnL": 0,
+    "dailyPnLPct": 0,
+    "peakEquity": 5006.815339627857,
+    "drawdownFromPeakPct": 0.0513165870850173,
+    "tradesOpened": 0,
+    "tradesClosed": 0,
+    "wins": 0,
+    "losses": 0,
+    "dailyLossLimitBreached": false,
+    "drawdownLimitBreached": false,
+    "consistencyOk": true
+  }
+]

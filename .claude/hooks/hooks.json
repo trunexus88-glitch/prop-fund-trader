@@ -1,0 +1,25 @@
+{
+  "hooks": [
+    {
+      "event": "PostToolUse",
+      "matcher": {
+        "tool_name": ["Write", "Edit", "MultiEdit"]
+      },
+      "command": "bash .claude/hooks/api-key-leak-detector.sh",
+      "description": "Scan modified files for hardcoded API keys and secrets",
+      "timeout_ms": 5000,
+      "on_failure": "block"
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": {
+        "tool_name": ["Write", "Edit", "MultiEdit"],
+        "file_path_pattern": "src/(engine|strategy)/.*\\.ts$"
+      },
+      "command": "bash .claude/hooks/stop-loss-enforcer.sh",
+      "description": "Warn when engine/strategy edits may be missing stop-loss guards or kill switch checks",
+      "timeout_ms": 5000,
+      "on_failure": "warn"
+    }
+  ]
+}
