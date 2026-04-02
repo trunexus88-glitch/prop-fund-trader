@@ -19,6 +19,8 @@ import { computeMetaConfidence, TIER_MULTIPLIERS } from '../engine/meta-confiden
 import type { RegimeAlignment } from '../engine/meta-confidence.js';
 import { isDirectionBlocked } from './asset-clusters.js';
 import type { MacroRegimeState } from './macro-regime-classifier.js';
+// Phase 22 — Layer B: MTF Confluence Gate
+import { computeMTFConfluence } from '../engine/mtf-confluence.js';
 
 export interface SignalGeneratorConfig {
   minConfidence: number;          // Default: 70
@@ -332,7 +334,24 @@ export class SignalGenerator {
 
     const side: OrderSide = stateResult.direction === 'LONG' ? 'buy' : 'sell';
 
-    // 4. Macro regime alignment (ALIGNED / NEUTRAL / CONFLICTING)
+    // 4. Phase 22 Layer B — MTF Confluence Gate
+    const mtf = computeMTFConfluence(
+      side,
+      candles,
+      extraCandles?.candles4h,
+      extraCandles?.candles1d
+    );
+
+    if (mtf.alignment === 'CONFLICT') {
+      signalLogger.debug('[v2] MTF conflict — direction opposed on majority of timeframes', {
+        instrument,
+        side,
+        details: mtf.details,
+      });
+      return [];
+    }
+
+    // 4b. Macro regime alignment (ALIGNED / NEUTRAL / CONFLICTING)
     const effectiveMacroRegime = macroRegime ?? 'NEUTRAL';
     const blocked = isDirectionBlocked(instrument, side, effectiveMacroRegime);
 
@@ -342,8 +361,9 @@ export class SignalGenerator {
         ? 'NEUTRAL'
         : 'ALIGNED';
 
-    // 5. Meta-confidence — combines state score + vol surface + regime
-    const meta = computeMetaConfidence(stateResult, volSurface, regimeAlignment);
+    // 5. Meta-confidence — combines state score + vol surface + regime + MTF confluence
+    // (historical Layer C delta is applied post-generation in index.ts)
+    const meta = computeMetaConfidence(stateResult, volSurface, regimeAlignment, mtf.confidenceDelta);
 
     // 6. Suppression gates
     if (meta.tier === 'NO_TRADE') {
@@ -400,6 +420,8 @@ export class SignalGenerator {
       transition_risk:   stateResult.transitionRisk,
       execution_tier:    meta.tier,
       meta_confidence:   parseFloat(meta.confidence.toFixed(4)),
+      // Phase 22 — Layer B
+      mtf_confluence:    mtf.alignment,
     };
 
     signalLogger.info('[v2] Signal generated', {

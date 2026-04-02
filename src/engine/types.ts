@@ -142,6 +142,13 @@ export interface TradeSignal {
   execution_tier?: ExecutionTier;
   /** Meta-confidence value (0–1) from combined state + vol + regime */
   meta_confidence?: number;
+  // ── Phase 22 — Competitive Edge Layers ───────────────────────────────────
+  /** Multi-timeframe trend consensus ('FULL_ALIGN' | 'PARTIAL_ALIGN' | 'CONFLICT') */
+  mtf_confluence?: string;
+  /** Historical win rate for instrument+direction (0–1); null if insufficient data */
+  history_win_rate?: number;
+  /** Number of historical trades used in the confidence enrichment */
+  history_sample_size?: number;
 }
 
 export interface IndicatorSnapshot {

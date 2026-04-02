@@ -43,6 +43,9 @@ export function startDashboard(
     executionTier: string;
     macroRegime: string;
     timestamp: string;
+    // Phase 22 — competitive edge layer fields
+    mtfConfluence?: string;
+    historyWinRate?: number;
   }>
 ) {
   const app = express();

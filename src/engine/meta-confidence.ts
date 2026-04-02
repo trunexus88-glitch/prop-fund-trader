@@ -41,10 +41,19 @@ export interface MetaConfidence {
 
 // ─── Core Computation ─────────────────────────────────────────────────────────
 
+/**
+ * @param stateResult      Output of computeStateScore()
+ * @param volSurface       Output of computeVolatilitySurface()
+ * @param regimeAlignment  Macro regime alignment verdict
+ * @param confluenceScore  Optional Phase 22 delta from MTF + historical layers.
+ *                         Pass the SUM of MTFConfluenceResult.confidenceDelta and
+ *                         HistoricalConfidenceResult.confidenceDelta.
+ */
 export function computeMetaConfidence(
   stateResult: StateResult,
   volSurface: VolatilitySurface,
-  regimeAlignment: RegimeAlignment
+  regimeAlignment: RegimeAlignment,
+  confluenceScore?: number
 ): MetaConfidence {
   // Start from absolute state score (0 to 1)
   let confidence = stateResult.absScore;
@@ -65,6 +74,13 @@ export function computeMetaConfidence(
   // NEUTRAL states have high transition risk (0.50) and lose 5 confidence pts.
   // STRONG states have low risk (0.15) and lose only 1.5 pts.
   confidence -= stateResult.transitionRisk * 0.10;
+
+  // ── Phase 22: MTF confluence + historical enrichment ────────────────────
+  // confluenceScore is the pre-summed delta from Layer B and Layer C.
+  // Applied last so the existing tier boundaries remain stable for Phase 21.
+  if (confluenceScore !== undefined) {
+    confidence += confluenceScore;
+  }
 
   confidence = Math.max(0, Math.min(1, confidence));
 

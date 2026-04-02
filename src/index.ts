@@ -18,7 +18,7 @@
  */
 
 import { config, loadConfig } from './utils/config.js';
-import { logger, tradeLogger, riskLogger } from './utils/logger.js';
+import { logger, tradeLogger, riskLogger, signalLogger } from './utils/logger.js';
 import { eventBus } from './utils/event-bus.js';
 import { loadAllFirmProfiles } from './firms/schema.js';
 import { AccountManager } from './accounts/account-manager.js';
@@ -42,6 +42,9 @@ import type { MacroRegimeState } from './strategy/macro-regime-classifier.js';
 // isDirectionBlocked is now internal to SignalGenerator.generateSignalsV2 (Phase 21)
 import { applyCorrelationLimit } from './strategy/correlation-limiter.js';
 import type { FirmProfile, TradeSignal, EngineEvent } from './engine/types.js';
+// Phase 22 — Competitive Edge Layers
+import { runOvernightBaseliner, isBaselineEnabled } from './engine/overnight-baseliner.js';
+import { computeHistoricalConfidence } from './engine/historical-confidence.js';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -92,6 +95,8 @@ let tickCount = 0;
 let lastRegimeUpdate = 0;
 let lastSignalCheck = 0;
 let lastDailyReview = '';
+/** ISO date of the last overnight baseliner run — prevents double-firing on the same UTC day */
+let lastBaselinerRun = '';
 
 /** Current macro regime — updated every REGIME_UPDATE_INTERVAL_MS alongside candle regime. */
 let currentMacroRegime: MacroRegimeState = 'NEUTRAL';
@@ -139,6 +144,9 @@ export interface SignalMetadata {
   executionTier: string;
   macroRegime: string;
   timestamp: string;
+  // Phase 22
+  mtfConfluence?: string;
+  historyWinRate?: number;
 }
 export const lastSignalMeta: Map<string, SignalMetadata> = new Map();
 
@@ -287,6 +295,18 @@ async function tick(): Promise<void> {
       lastDailyReview = today;
     }
 
+    // 5b. Phase 22 — overnight baseliner at 00:00 UTC
+    // Evaluates each instrument's prior-24h performance and disables underperformers.
+    if (currentHour === 0 && lastBaselinerRun !== today) {
+      const allTrades: import('./engine/types.js').ClosedTrade[] = [];
+      for (const [, account] of accountManager.getAccounts()) {
+        allTrades.push(...account.state.all_closed_trades);
+      }
+      const allInstruments = [...new Set([...INSTRUMENTS, ...FOREX_INSTRUMENTS])];
+      runOvernightBaseliner(allInstruments, allTrades);
+      lastBaselinerRun = today;
+    }
+
     // 6. Log summary every 30 ticks (~1 min)
     if (tickCount % 30 === 0) {
       logSummary();
@@ -402,6 +422,12 @@ async function generateAndProcessSignals(): Promise<void> {
         // Per-instrument cooldown — skip if the signal interval hasn't elapsed
         if (!isInstrumentCooledDown(instrument)) continue;
 
+        // Phase 22 Layer A — Baseliner gate: skip instruments disabled overnight
+        if (!isBaselineEnabled(instrument)) {
+          logger.debug(`[baseliner] ${instrument} disabled — skipping signal generation`);
+          continue;
+        }
+
         // ── Step 6: Fetch primary + extra timeframes ──────────────────────────
         const candles = await account.adapter.getCandles(instrument, '5m', 250);
 
@@ -425,7 +451,41 @@ async function generateAndProcessSignals(): Promise<void> {
           currentMacroRegime
         );
 
+        // Collect all closed trades for historical enrichment (Layer C)
+        const allClosedTrades: import('./engine/types.js').ClosedTrade[] = [];
+        for (const [, acct] of accountManager.getAccounts()) {
+          allClosedTrades.push(...acct.state.all_closed_trades);
+        }
+
         for (const signal of rawSignals) {
+          // Phase 22 Layer C — Historical Confidence Enrichment
+          // Applied here (post-V2) because signal-generator has no account access.
+          const histResult = computeHistoricalConfidence(
+            signal.instrument,
+            signal.side,
+            allClosedTrades
+          );
+
+          // Clamp adjusted confidence to [0, 1] and update the signal fields
+          const adjustedConf = Math.max(0, Math.min(1,
+            (signal.meta_confidence ?? 0) + histResult.confidenceDelta
+          ));
+          signal.meta_confidence      = parseFloat(adjustedConf.toFixed(4));
+          signal.history_win_rate     = histResult.sampleSize >= 5 ? histResult.winRate : undefined;
+          signal.history_sample_size  = histResult.sampleSize;
+
+          // Re-evaluate tier after history adjustment (mirrors meta-confidence tier logic)
+          if (adjustedConf >= 0.80)      signal.execution_tier = 'FULL';
+          else if (adjustedConf >= 0.70) signal.execution_tier = 'HALF';
+          else if (adjustedConf >= 0.60) signal.execution_tier = 'QUARTER';
+          else {
+            // History downgraded signal below NO_TRADE floor — suppress
+            signalLogger.debug('[hist-conf] Signal suppressed after history penalty', {
+              instrument, histWR: histResult.winRate.toFixed(2), adjustedConf,
+            });
+            continue;
+          }
+
           // Anchor entry to the live simulated price (preserving the adaptive
           // stop distance computed by the volatility engine).
           const currentPrice = simulatedPrices.get(instrument);
@@ -449,7 +509,8 @@ async function generateAndProcessSignals(): Promise<void> {
           candidates.push(signal);
 
           // Update last-signal metadata store for dashboard cards
-          if (signal.execution_tier && signal.execution_tier !== 'NO_TRADE') {
+          // execution_tier is guaranteed non-NO_TRADE here (NO_TRADE path does `continue`)
+          if (signal.execution_tier) {
             lastSignalMeta.set(instrument, {
               instrument,
               side:             signal.side,
@@ -461,6 +522,8 @@ async function generateAndProcessSignals(): Promise<void> {
               executionTier:    signal.execution_tier,
               macroRegime:      currentMacroRegime,
               timestamp:        signal.timestamp,
+              mtfConfluence:    signal.mtf_confluence,
+              historyWinRate:   signal.history_win_rate,
             });
           }
         }
